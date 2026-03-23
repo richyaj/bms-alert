@@ -2,54 +2,43 @@ name: BMS IMAX Alert — Project Hail Mary
 
 on:
   schedule:
-    # Runs every 5 minutes (GitHub Actions minimum is 5 min)
-    - cron: "*/5 * * * *"
-  workflow_dispatch:        # Allows manual trigger from GitHub UI for testing
+    # Every 2 hours, 6am–midnight IST (00:30–18:30 UTC)
+    - cron: "30 0,2,4,6,8,10,12,14,16,18 * * *"
+  workflow_dispatch:
 
 jobs:
   check-bms:
     name: Check BookMyShow for IMAX bookings
     runs-on: ubuntu-latest
-    timeout-minutes: 4      # Kill if it runs too long (safety net)
+    timeout-minutes: 4
 
     steps:
-      # ── 1. Checkout the repo ──────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ─────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # ── 3. Install dependencies ───────────────────────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Restore alert state (prevents duplicate alerts) ────────────────
-      #    We store state as a GitHub Actions Cache keyed by a fixed name.
-      #    On each run: restore → check → update → save back.
       - name: Restore alert state cache
         uses: actions/cache@v4
         with:
           path: alert_state.json
           key: bms-alert-state-v1
-          restore-keys: |
-            bms-alert-state-v1
+          restore-keys: bms-alert-state-v1
 
-      # ── 5. Run the checker ────────────────────────────────────────────────
       - name: Run BMS checker
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
         run: python check_bms.py
 
-      # ── 6. Save updated state back to cache ───────────────────────────────
-      #    Note: actions/cache saves automatically at end of job if key matched.
-      #    We force-save by always uploading the artifact too.
-      - name: Upload state artifact (backup)
+      - name: Upload state artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
