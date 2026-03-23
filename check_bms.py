@@ -1,43 +1,38 @@
 """
 BookMyShow IMAX Alert System
-Checks for IMAX bookings for a specific movie in Chennai and sends Telegram alerts.
+Scrapes BMS Chennai page for Project Hail Mary IMAX bookings.
+Sends push notification via ntfy.sh when booking opens.
 """
 
 import os
 import json
-import time
 import hashlib
 import logging
 import requests
 from datetime import datetime
-from typing import Optional
+from bs4 import BeautifulSoup
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Configuration ─────────────────────────────────────────────────────────────
 
 CONFIG = {
     "movie_name": "Project Hail Mary",
-    "city_code": "CHEN",          # Chennai BMS city code
-    "city_name": "Chennai",
-    "show_type": "IMAX",          # Alert keyword to look for
-    "ntfy_topic": os.environ.get("NTFY_TOPIC", "bms-imax-alert-chennai"),
-    # State file path — in GitHub Actions use a gist or artifact; locally just a file
+    "city": "chennai",
+    "show_type": "IMAX",
+    "ntfy_topic": os.environ.get("NTFY_TOPIC", ""),
     "state_file": "alert_state.json",
-    # BMS API endpoints (public, no auth required)
-    "bms_search_url": "https://in.bookmyshow.com/api/explore/v1/discover/movies",
-    "bms_event_url": "https://in.bookmyshow.com/buytickets/{event_code}/movie-{city}-{date}/",
+    "bms_url": "https://in.bookmyshow.com/chennai/movies",
 }
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/123.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/html, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
-    "Referer": "https://in.bookmyshow.com/",
-    "X-Region-Code": "CHEN",
-    "X-Region-Slug": "chennai",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 logging.basicConfig(
@@ -47,295 +42,210 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── State Management (prevent duplicate alerts) ───────────────────────────────
+# ─── State Management ──────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    """Load persisted state (which alerts have already been sent)."""
-    # GitHub Actions: read from environment variable set by gist-based state
-    state_json = os.environ.get("ALERT_STATE_JSON", "")
-    if state_json:
-        try:
-            return json.loads(state_json)
-        except json.JSONDecodeError:
-            pass
-
     if os.path.exists(CONFIG["state_file"]):
         with open(CONFIG["state_file"], "r") as f:
             return json.load(f)
-
-    return {"alerted_shows": [], "last_check": None}
+    return {"alerted_hashes": [], "last_check": None}
 
 
 def save_state(state: dict):
-    """Save state to local file (GitHub Actions artifact handles persistence)."""
     state["last_check"] = datetime.utcnow().isoformat()
     with open(CONFIG["state_file"], "w") as f:
         json.dump(state, f, indent=2)
-    log.info("State saved to %s", CONFIG["state_FILE"] if False else CONFIG["state_file"])
-    # Also print for GitHub Actions to capture as output
-    print(f"::set-output name=alert_state::{json.dumps(state)}")
+    log.info("State saved.")
 
 
-def make_show_id(show: dict) -> str:
-    """Create a unique ID for a show to track duplicates."""
-    key = f"{show.get('EventCode','')}-{show.get('ShowType','')}-{show.get('Date','')}"
-    return hashlib.md5(key.encode()).hexdigest()
+def make_hash(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()
 
-# ─── BookMyShow API Calls ──────────────────────────────────────────────────────
+# ─── Scraper ───────────────────────────────────────────────────────────────────
 
-def search_movie(movie_name: str, city_code: str) -> Optional[dict]:
-    """Search for a movie by name in a city using BMS's internal API."""
-    url = "https://in.bookmyshow.com/api/explore/v1/discover/movies"
-    params = {
-        "appCode": "MOBAND2",
-        "appVersion": "14.3.4",
-        "language": "en",
-        "region": city_code,
-        "regionCode": city_code,
-        "subRegion": city_code,
-        "bmsId": "1.21.1",
-        "token": "",
-        "lat": "13.0827",
-        "lon": "80.2707",
-        "page": "1",
-        "limit": "10",
-    }
+def check_bms_for_movie() -> list[dict]:
+    found = []
 
+    # Try 1: BMS Chennai movies listing page
     try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        log.info("Fetching BMS Chennai movies page...")
+        resp = requests.get(CONFIG["bms_url"], headers=HEADERS, timeout=20)
+        log.info("Response status: %d", resp.status_code)
+        soup = BeautifulSoup(resp.text, "lxml")
+        movie_name_lower = CONFIG["movie_name"].lower()
 
-        movies = (
-            data.get("BookMyShow", {})
-                .get("arrEvents", [])
-        )
-
-        for movie in movies:
-            name = movie.get("EventTitle", "")
-            if movie_name.lower() in name.lower():
-                log.info("Found movie: %s (Code: %s)", name, movie.get("EventCode"))
-                return movie
-
-        log.info("Movie '%s' not found in current listings.", movie_name)
-        return None
-
-    except requests.RequestException as e:
-        log.error("Error searching for movie: %s", e)
-        return None
-
-
-def get_movie_shows(event_code: str, city_code: str) -> list[dict]:
-    """Get show listings for a specific movie event code."""
-    today = datetime.now().strftime("%Y%m%d")
-    url = f"https://in.bookmyshow.com/api/movies-data/showtimes-by-event"
-
-    params = {
-        "appCode": "MOBAND2",
-        "appVersion": "14.3.4",
-        "language": "en",
-        "bmsId": "1.21.1",
-        "region": city_code,
-        "regionCode": city_code,
-        "eventCode": event_code,
-        "ShowDate": today,
-        "pageCount": "1",
-        "token": "",
-    }
-
-    try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        shows = data.get("ShowDetails", [])
-        log.info("Retrieved %d venue/show groups", len(shows))
-        return shows
-
-    except requests.RequestException as e:
-        log.error("Error fetching showtimes: %s", e)
-        return []
-
-
-def find_imax_shows(shows: list[dict], show_type_keyword: str) -> list[dict]:
-    """Filter shows to only IMAX (or whichever format specified)."""
-    imax_shows = []
-
-    for venue_group in shows:
-        venue_name = venue_group.get("VenueName", "Unknown Venue")
-        venue_code = venue_group.get("VenueCode", "")
-
-        for show_time_group in venue_group.get("ShowTimeList", []):
-            for show in show_time_group.get("ShowTimes", []):
-                show_name = (
-                    show.get("ShowType", "")
-                    + " " + show.get("ShowExperience", "")
-                    + " " + show.get("ScreenName", "")
-                ).upper()
-
-                if show_type_keyword.upper() in show_name:
-                    # Check booking is actually open
-                    booking_open = show.get("IsAvailable", False) or \
-                                   show.get("ShowStatus", "") in ("OPEN", "BOOK")
-
-                    imax_shows.append({
-                        "VenueName": venue_name,
-                        "VenueCode": venue_code,
-                        "ShowType": show.get("ShowType", ""),
-                        "ShowExperience": show.get("ShowExperience", ""),
-                        "ShowTime": show.get("ShowTime", ""),
-                        "Date": show.get("ShowDate", datetime.now().strftime("%Y%m%d")),
-                        "BookingOpen": booking_open,
-                        "ShowId": show.get("ShowId", ""),
-                        "EventCode": show.get("EventCode", ""),
+        for tag in soup.find_all(["a", "div", "span", "h2", "h3", "p"]):
+            text = tag.get_text(" ", strip=True)
+            if movie_name_lower in text.lower():
+                href = tag.get("href", "")
+                if "buytickets" in href or "book-tickets" in href.lower():
+                    url = href if href.startswith("http") else f"https://in.bookmyshow.com{href}"
+                    found.append({
+                        "source": "bms_listing",
+                        "title": text[:80],
+                        "url": url,
+                        "imax": CONFIG["show_type"].lower() in text.lower(),
                     })
-
-    return imax_shows
-
-# ─── BMS HTML Fallback Scraper ─────────────────────────────────────────────────
-
-def scrape_bms_page_fallback(movie_name: str, city: str, show_type: str) -> list[dict]:
-    """
-    Fallback: directly scrape the BMS search page if API fails.
-    Returns mock-structured data for IMAX show detection.
-    """
-    try:
-        from bs4 import BeautifulSoup
-
-        search_url = f"https://in.bookmyshow.com/{city.lower()}/movies"
-        resp = requests.get(search_url, headers=HEADERS, timeout=20)
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        found = []
-        # Look for movie cards containing the movie name and IMAX badge
-        for card in soup.select("[class*='movie-card'], [class*='__name'], a[href*='buytickets']"):
-            text = card.get_text(" ", strip=True)
-            href = card.get("href", "")
-            if movie_name.lower() in text.lower() and show_type.upper() in text.upper():
-                found.append({
-                    "VenueName": "See booking link",
-                    "ShowType": show_type,
-                    "ShowTime": "Check link",
-                    "Date": datetime.now().strftime("%Y%m%d"),
-                    "BookingOpen": True,
-                    "BookingURL": f"https://in.bookmyshow.com{href}" if href.startswith("/") else href,
-                })
-
-        return found
+                    log.info("Found booking link: %s", url)
+                else:
+                    log.info("Movie mentioned (no booking link yet): %s", text[:80])
 
     except Exception as e:
-        log.error("HTML fallback scraper failed: %s", e)
-        return []
+        log.error("BMS listing scrape failed: %s", e)
 
-# ─── Telegram Notifications ────────────────────────────────────────────────────
+    # Try 2: BMS search page
+    if not found:
+        try:
+            search_url = "https://in.bookmyshow.com/search"
+            params = {"q": CONFIG["movie_name"], "city": CONFIG["city"]}
+            resp = requests.get(search_url, headers=HEADERS, params=params, timeout=20)
+            soup = BeautifulSoup(resp.text, "lxml")
 
-def send_ntfy_alert(shows: list[dict], movie_name: str):
+            for tag in soup.find_all("a", href=True):
+                href = tag["href"]
+                text = tag.get_text(" ", strip=True)
+                if "buytickets" in href and CONFIG["movie_name"].lower() in (href + text).lower():
+                    url = href if href.startswith("http") else f"https://in.bookmyshow.com{href}"
+                    found.append({
+                        "source": "bms_search",
+                        "title": text[:80] or CONFIG["movie_name"],
+                        "url": url,
+                        "imax": CONFIG["show_type"].lower() in (href + text).lower(),
+                    })
+
+        except Exception as e:
+            log.error("BMS search scrape failed: %s", e)
+
+    # Try 3: Google search fallback
+    if not found:
+        try:
+            log.info("Trying Google search fallback...")
+            query = f"{CONFIG['movie_name']} IMAX Chennai bookmyshow book tickets"
+            google_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
+            g_headers = {**HEADERS, "Referer": "https://www.google.com/"}
+            resp = requests.get(google_url, headers=g_headers, timeout=20)
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            for tag in soup.find_all("a", href=True):
+                href = tag["href"]
+                if "bookmyshow.com" in href and "buytickets" in href:
+                    if href.startswith("/url?q="):
+                        href = href.split("/url?q=")[1].split("&")[0]
+                    found.append({
+                        "source": "google",
+                        "title": CONFIG["movie_name"],
+                        "url": href,
+                        "imax": True,
+                    })
+                    log.info("Found via Google: %s", href)
+
+        except Exception as e:
+            log.error("Google fallback failed: %s", e)
+
+    return found
+
+# ─── Ntfy Notification ─────────────────────────────────────────────────────────
+
+def send_ntfy_alert(results: list[dict]):
     topic = CONFIG["ntfy_topic"]
-    venue_list = ", ".join(s.get("VenueName", "Theatre") for s in shows[:3])
-    
-    resp = requests.post(
-        f"https://ntfy.sh/{topic}",
-        headers={
-            "Title": f"🎬 IMAX Booking Open — {movie_name}!",
-            "Priority": "urgent",
-            "Tags": "movie_camera,rotating_light",
-            "Click": "https://in.bookmyshow.com/chennai/movies",
-        },
-        data=f"IMAX shows now bookable in Chennai!\nVenues: {venue_list}\nBook at: https://in.bookmyshow.com/chennai/movies".encode("utf-8"),
-        timeout=10,
+    movie = CONFIG["movie_name"]
+
+    if not topic:
+        log.warning("NTFY_TOPIC not set — would have sent alert:")
+        for r in results:
+            log.info("  %s | %s", r.get("title"), r.get("url"))
+        return False
+
+    imax_results = [r for r in results if r.get("imax")]
+    best = imax_results[0] if imax_results else results[0]
+    booking_url = best.get("url", "https://in.bookmyshow.com/chennai/movies")
+
+    body = (
+        f"Booking is OPEN in Chennai!\n"
+        f"Format: {CONFIG['show_type']}\n"
+        f"Detected: {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}"
     )
-    return resp.status_code == 200
 
-
-def send_telegram_heartbeat():
-    """Optional: send a daily heartbeat so you know the bot is running."""
-    token = CONFIG["telegram_bot_token"]
-    chat_id = CONFIG["telegram_chat_id"]
-    if not token or not chat_id:
-        return
-
-    hour = datetime.utcnow().hour
-    # Only send heartbeat once per day around 09:00 UTC (14:30 IST)
-    if hour != 9:
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": (
-            f"🤖 BMS Alert Bot is running\n"
-            f"Monitoring: *{CONFIG['movie_name']}* ({CONFIG['show_type']}) in {CONFIG['city_name']}\n"
-            f"Time: {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}"
-        ),
-        "parse_mode": "Markdown",
-    }
     try:
-        requests.post(url, json=payload, timeout=10)
+        resp = requests.post(
+            f"https://ntfy.sh/{topic}",
+            headers={
+                "Title": f"🎬 {movie} — IMAX Tickets Live!",
+                "Priority": "urgent",
+                "Tags": "movie_camera,rotating_light",
+                "Click": booking_url,
+            },
+            data=body.encode("utf-8"),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        log.info("✅ Ntfy alert sent to topic '%s'!", topic)
+        return True
+    except requests.RequestException as e:
+        log.error("Failed to send ntfy alert: %s", e)
+        return False
+
+
+def send_ntfy_heartbeat():
+    topic = CONFIG["ntfy_topic"]
+    if not topic or datetime.utcnow().hour != 9:
+        return
+    try:
+        requests.post(
+            f"https://ntfy.sh/{topic}",
+            headers={
+                "Title": "🤖 BMS Alert Bot — Still Running",
+                "Priority": "low",
+                "Tags": "white_check_mark",
+            },
+            data=(
+                f"Monitoring: {CONFIG['movie_name']} ({CONFIG['show_type']}) in Chennai\n"
+                f"{datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}"
+            ).encode("utf-8"),
+            timeout=10,
+        )
     except Exception:
         pass
 
-# ─── Main Logic ────────────────────────────────────────────────────────────────
+# ─── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     log.info("=" * 60)
-    log.info("BookMyShow IMAX Alert — %s", datetime.utcnow().isoformat())
-    log.info("Movie: %s | City: %s | Format: %s",
-             CONFIG["movie_name"], CONFIG["city_name"], CONFIG["show_type"])
+    log.info("BMS IMAX Alert Check — %s", datetime.utcnow().isoformat())
+    log.info("Movie: %s | Format: %s | City: Chennai", CONFIG["movie_name"], CONFIG["show_type"])
     log.info("=" * 60)
 
     state = load_state()
-    already_alerted = set(state.get("alerted_shows", []))
+    already_alerted = set(state.get("alerted_hashes", []))
 
-    # ── Step 1: Search for the movie ──
-    movie = search_movie(CONFIG["movie_name"], CONFIG["city_code"])
+    results = check_bms_for_movie()
+    log.info("Total booking results found: %d", len(results))
 
-    imax_shows = []
-
-    if movie:
-        event_code = movie.get("EventCode", "")
-        log.info("Event code: %s", event_code)
-
-        # ── Step 2: Fetch showtimes ──
-        shows = get_movie_shows(event_code, CONFIG["city_code"])
-
-        # ── Step 3: Filter for IMAX ──
-        imax_shows = find_imax_shows(shows, CONFIG["show_type"])
-        log.info("IMAX shows found via API: %d", len(imax_shows))
-    else:
-        log.info("Movie not in API listings yet. Trying HTML fallback...")
-        imax_shows = scrape_bms_page_fallback(
-            CONFIG["movie_name"], CONFIG["city_name"], CONFIG["show_type"]
-        )
-        log.info("IMAX shows found via HTML fallback: %d", len(imax_shows))
-
-    if not imax_shows:
-        log.info("No IMAX shows found. Booking not open yet. Will check again later.")
-        send_telegram_heartbeat()
+    if not results:
+        log.info("No bookings found yet. Will check again later.")
+        send_ntfy_heartbeat()
         save_state(state)
         return
 
-    # ── Step 4: Filter out already-alerted shows ──
-    new_shows = []
-    for show in imax_shows:
-        show_id = make_show_id(show)
-        if show_id not in already_alerted:
-            show["_id"] = show_id
-            new_shows.append(show)
+    new_results = []
+    for r in results:
+        h = make_hash(r.get("url", r.get("title", "")))
+        if h not in already_alerted:
+            r["_hash"] = h
+            new_results.append(r)
 
-    if not new_shows:
-        log.info("IMAX shows found but already alerted. No duplicate notification sent.")
+    if not new_results:
+        log.info("Bookings found but already alerted. No duplicate sent.")
         save_state(state)
         return
 
-    log.info("🚨 NEW IMAX shows detected: %d", len(new_shows))
-
-    # ── Step 5: Send alert ──
-    sent = send_ntfy_alert(new_shows, CONFIG["movie_name"])
+    log.info("🚨 NEW bookings detected: %d", len(new_results))
+    sent = send_ntfy_alert(new_results)
 
     if sent:
-        # Mark these shows as alerted
-        for show in new_shows:
-            already_alerted.add(show["_id"])
-        state["alerted_shows"] = list(already_alerted)
+        for r in new_results:
+            already_alerted.add(r["_hash"])
+        state["alerted_hashes"] = list(already_alerted)
 
     save_state(state)
     log.info("Done.")
