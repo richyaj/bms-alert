@@ -261,8 +261,20 @@ def main():
 
     if not results:
         log.info("No bookings found yet. Will check again later.")
-        send_ntfy_heartbeat()
         save_state(state)
+        # Notify on every run so you know it's working
+        topic = CONFIG["ntfy_topic"]
+        if topic:
+            requests.post(
+                f"https://ntfy.sh/{topic}",
+                headers={
+                    "Title": "BMS Alert - No bookings yet",
+                    "Priority": "low",
+                    "Tags": "hourglass_flowing_sand",
+                },
+                data=f"Still monitoring: {CONFIG['movie_name']} IMAX Chennai\nChecked: {datetime.now(UTC).strftime('%d %b %Y %H:%M UTC')}".encode(),
+                timeout=10,
+            )
         return
 
     new_results = []
