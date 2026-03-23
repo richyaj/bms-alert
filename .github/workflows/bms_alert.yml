@@ -1,0 +1,58 @@
+name: BMS IMAX Alert — Project Hail Mary
+
+on:
+  schedule:
+    # Runs every 5 minutes (GitHub Actions minimum is 5 min)
+    - cron: "*/5 * * * *"
+  workflow_dispatch:        # Allows manual trigger from GitHub UI for testing
+
+jobs:
+  check-bms:
+    name: Check BookMyShow for IMAX bookings
+    runs-on: ubuntu-latest
+    timeout-minutes: 4      # Kill if it runs too long (safety net)
+
+    steps:
+      # ── 1. Checkout the repo ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ─────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Restore alert state (prevents duplicate alerts) ────────────────
+      #    We store state as a GitHub Actions Cache keyed by a fixed name.
+      #    On each run: restore → check → update → save back.
+      - name: Restore alert state cache
+        uses: actions/cache@v4
+        with:
+          path: alert_state.json
+          key: bms-alert-state-v1
+          restore-keys: |
+            bms-alert-state-v1
+
+      # ── 5. Run the checker ────────────────────────────────────────────────
+      - name: Run BMS checker
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python check_bms.py
+
+      # ── 6. Save updated state back to cache ───────────────────────────────
+      #    Note: actions/cache saves automatically at end of job if key matched.
+      #    We force-save by always uploading the artifact too.
+      - name: Upload state artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alert-state
+          path: alert_state.json
+          retention-days: 7
+          overwrite: true
