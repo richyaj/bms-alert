@@ -18,7 +18,7 @@ from datetime import datetime, UTC
 from bs4 import BeautifulSoup
 
 CONFIG = {
-    "movie_name": "Dhurandhar The Revenge",
+    "movie_name": "Project Hail Mary",
     "city": "chennai",
     "city_code": "CHEN",
     "show_type": "IMAX",
